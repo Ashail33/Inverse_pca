@@ -1,0 +1,304 @@
+# Inverse PCA: Synthetic High-Dimensional Data from a Latent Space
+
+`inverse_pca` runs PCA *backwards*. Instead of fitting principal components
+to a real dataset, you **prescribe** the statistical structure — a mean
+vector, an orthonormal basis, a spectrum of variances, a latent distribution,
+and (optionally) a noise level — and draw high-dimensional samples that obey
+that structure exactly.
+
+This makes it easy to produce controlled benchmarks: low intrinsic
+dimensionality embedded in a high ambient dimension, heavy-tailed factors,
+isotropic vs. anisotropic noise, etc.
+
+---
+
+## Installation
+
+```bash
+pip install -e .            # editable install
+pip install -e .[test]      # plus pytest
+```
+
+Only dependency is `numpy>=1.22`.
+
+---
+
+## Quick start
+
+```python
+from inverse_pca import InversePCAGenerator
+
+gen = InversePCAGenerator(
+    n_features=200,        # ambient dimensionality d
+    n_components=5,        # latent dimensionality k
+    spectrum="power",      # how component variances decay
+    spectrum_decay=1.5,    # alpha in lambda_i = i^(-alpha)
+    noise_std=0.05,        # isotropic residual noise
+    latent_dist="gaussian",
+    random_state=0,
+)
+
+X, Z = gen.sample(2_000, return_latent=True)
+# X: (2000, 200) high-dimensional samples
+# Z: (2000, 5) standardised latent scores used to make X
+```
+
+`gen.components_`, `gen.explained_variance_`, `gen.explained_variance_ratio_`,
+`gen.mean_`, and `gen.covariance()` expose the population quantities the
+generator was built from. They are the *ground truth* — re-fitting PCA on `X`
+should recover them up to sampling error.
+
+The convenience wrapper
+
+```python
+from inverse_pca import make_synthetic_dataset
+X, Z, gen = make_synthetic_dataset(n_samples=2_000, n_features=200,
+                                   n_components=5, random_state=0)
+```
+
+does the same in one call.
+
+---
+
+## The maths
+
+### Forward PCA on a real dataset A
+
+1. Centre: `mu = A.mean(axis=0)`, `A_c = A - mu`.
+2. Sample covariance: `Cov(A) = (1/(n-1)) A_c.T @ A_c`.
+3. Eigendecomposition: `Cov(A) = V Λ V.T`, with `V` orthonormal eigenvectors
+   (columns) and `Λ = diag(λ_1, …, λ_d)` with `λ_1 ≥ λ_2 ≥ …`.
+4. Truncate to the top `k`: keep `V_k ∈ R^{d×k}` and `λ_{1..k}`.
+5. Scores (low-dimensional representation): `T = A_c V_k`.
+6. Reconstruction: `A_hat = T V_k.T + mu`.
+
+In step 5, the scores have empirical variance equal to the eigenvalues:
+`Var(T_i) ≈ λ_i`. This is the property we have to put back by hand when going
+the other way.
+
+### The inverse construction
+
+We never have `A`. Instead we *choose* the population covariance directly.
+Pick:
+
+- a length-`d` mean vector `mu`,
+- an orthonormal `d × k` basis `V`,
+- a non-negative spectrum `λ ∈ R^k`,
+- a standardised latent distribution `p(Z)` with `E[Z]=0`, `Cov(Z)=I_k`,
+- a noise level `σ ≥ 0`.
+
+A draw is then
+
+```
+Z       ~ p           (n × k, unit-variance latent scores)
+X_signal = mu + (Z * sqrt(lambda)) @ V.T          (n × d)
+X        = X_signal + sigma * eps,    eps ~ N(0, I_d)
+```
+
+The `sqrt(λ)` factor is what makes the prescribed spectrum show up
+empirically — without it every latent direction would have unit variance and
+re-fitting PCA on `X` would return `λ_i ≈ 1`.
+
+This is exactly the reconstruction line `np.dot(data_reduced, components) + mean`
+that you would use after fitting PCA, with `data_reduced = Z * sqrt(λ)` and
+`components = V.T`.
+
+### Implied population covariance
+
+Because `Z` is standardised and independent of `eps`,
+
+```
+Cov(X) = V diag(lambda) V.T + sigma^2 I_d.
+```
+
+So the rank-`k` "signal" covariance is exactly the spectral form, and a real
+PCA fitted on a large sample of `X` will recover `V`, `λ`, plus a noise floor
+of roughly `σ²` on the discarded `d − k` axes (the classic *probabilistic
+PCA* / *factor analysis* picture, Tipping & Bishop 1999).
+
+`gen.covariance()` returns this matrix directly so you can compare it against
+`np.cov(X.T)` from a sample.
+
+### Round-trip
+
+`gen.transform(Z)` evaluates `mu + (Z * sqrt(λ)) V.T` (no noise).
+`gen.inverse_transform(X)` returns `((X − mu) V) / sqrt(λ)`. Because `V` is
+orthonormal, these are exact inverses on the noise-free signal:
+
+```python
+np.allclose(gen.inverse_transform(gen.transform(Z)), Z)  # True
+```
+
+---
+
+## Tweaking the statistical properties
+
+Each constructor argument changes one feature of the generated population.
+Below is the full matrix of knobs, with the effect each one has on a sample
+drawn from the generator.
+
+### 1. Intrinsic vs. ambient dimensionality — `n_features`, `n_components`
+
+`n_features = d` is what you actually observe. `n_components = k` is the
+intrinsic rank of the signal. With `k ≪ d` and `noise_std = 0`, all samples
+lie on a `k`-dimensional affine subspace of `R^d`. Increasing `noise_std`
+fattens that subspace into a thin "pancake".
+
+```python
+# 5-d signal in 1000-d ambient space, noise floor at 0.01
+gen = InversePCAGenerator(n_features=1000, n_components=5, noise_std=0.01)
+```
+
+### 2. Eigenvalue profile — `spectrum`, `spectrum_decay`
+
+Controls how much variance each latent axis carries.
+
+| Choice            | Formula                          | Use when…                                  |
+| ----------------- | -------------------------------- | ------------------------------------------ |
+| `"power"` (def.)  | `λ_i = i^(-α)`                   | Natural-image-like, slow polynomial decay  |
+| `"exponential"`   | `λ_i = exp(-α (i-1))`            | Rapidly diminishing returns past first PCs |
+| `"linear"`        | `λ_i = max(1 − (i−1)/k, ε)`      | Roughly equal but ranked components        |
+| `"uniform"`       | `λ_i = 1`                        | Isotropic latent (no preferred direction)  |
+| explicit `array`  | whatever you pass                | Reproduce a specific real spectrum         |
+| callable `f(k)`   | user-defined                     | Custom rules (e.g. plateau then drop)      |
+
+`spectrum_decay = α` is the only knob for the parametric profiles. Larger
+`α` ⇒ steeper concentration in the leading components.
+
+```python
+# Reproduce a measured spectrum from a real dataset
+real_eigs = np.array([12.4, 3.1, 1.7, 0.9, 0.4])
+gen = InversePCAGenerator(n_features=50, n_components=5, spectrum=real_eigs)
+```
+
+### 3. Mean vector — `mean`
+
+Shifts the cloud bodily. Doesn't change covariance, only `E[X]`.
+
+```python
+gen = InversePCAGenerator(n_features=20, n_components=3,
+                          mean=np.linspace(-1, 1, 20))
+```
+
+### 4. Basis orientation — `basis`
+
+If omitted, a uniformly random orthonormal `V` is drawn. Pass your own when
+you want axis-aligned signal, sparse loadings, or to copy the basis from a
+real fit.
+
+```python
+# Axis-aligned: first k canonical directions carry all signal
+V = np.eye(d)[:, :k]
+gen = InversePCAGenerator(n_features=d, n_components=k, basis=V)
+```
+
+A `ValueError` is raised if the supplied basis is not orthonormal — that is
+required for `Cov(X)` to factor cleanly.
+
+### 5. Latent distribution — `latent_dist`, `df`
+
+Changes the *shape* of the signal cloud, but not its covariance (each option
+is rescaled to unit variance so that the prescribed spectrum still holds).
+
+| Choice         | Effect                                                          |
+| -------------- | --------------------------------------------------------------- |
+| `"gaussian"`   | Elliptical contours, no skew / kurtosis                         |
+| `"uniform"`    | Bounded support, sharp edges (good for ICA-style benchmarks)    |
+| `"laplace"`    | Heavier tails than Gaussian, peaked at zero                     |
+| `"t"` + `df`   | Very heavy tails (small `df`); `df > 2` enforced for finite var |
+| callable       | Anything: mixtures of Gaussians ⇒ clusters, copulas ⇒ deps      |
+
+A custom callable receives `(n_samples, n_components, rng)` and must return
+an `(n, k)` array. Example clustered latent:
+
+```python
+def two_clusters(n, k, rng):
+    centres = np.array([[ 1.5]*k, [-1.5]*k])
+    labels  = rng.integers(0, 2, size=n)
+    return centres[labels] + rng.standard_normal((n, k)) * 0.5
+
+gen = InversePCAGenerator(n_features=100, n_components=4,
+                          latent_dist=two_clusters, spectrum="uniform")
+```
+
+### 6. Residual noise — `noise_std`
+
+Adds isotropic Gaussian noise `eps ~ N(0, σ² I_d)` after projection. Makes
+the model identical to *probabilistic PCA*. Push `σ` up and the leading
+empirical eigenvalues stay near `λ_i + σ²` while the trailing `d − k` ones
+form a noise floor at `σ²`.
+
+```python
+gen = InversePCAGenerator(n_features=200, n_components=5,
+                          spectrum="exponential", spectrum_decay=0.7,
+                          noise_std=0.2)
+```
+
+### 7. Reproducibility — `random_state`
+
+An int seed or a `np.random.Generator`. Controls *both* the random
+orthonormal basis (when `basis is None`) and every subsequent
+`sample()` call.
+
+---
+
+## Recipes
+
+```python
+# (a) Small-N, large-p classification benchmark with a clean low-rank signal
+def labelled_latent(n, k, rng):
+    y = rng.integers(0, 3, size=n)                 # 3 classes
+    centres = rng.standard_normal((3, k)) * 2.0
+    return centres[y] + rng.standard_normal((n, k))
+
+X, Z, gen = make_synthetic_dataset(
+    n_samples=300, n_features=5_000, n_components=8,
+    spectrum="power", spectrum_decay=1.0,
+    latent_dist=labelled_latent, noise_std=0.1, random_state=0,
+)
+
+# (b) "Spiked" covariance for testing eigenvalue thresholding
+gen = InversePCAGenerator(
+    n_features=500, n_components=3,
+    spectrum=np.array([20.0, 10.0, 5.0]),  # three clearly spiked eigenvalues
+    noise_std=1.0,                          # bulk Marchenko–Pastur-style noise
+)
+
+# (c) Heavy-tailed factor model (returns-like data)
+gen = InversePCAGenerator(
+    n_features=50, n_components=4,
+    spectrum="exponential", spectrum_decay=0.5,
+    latent_dist="t", df=4.0,
+    noise_std=0.02,
+)
+```
+
+---
+
+## Verifying the construction
+
+Run the bundled demo and unit tests:
+
+```bash
+PYTHONPATH=. python examples/demo.py
+PYTHONPATH=. python -m pytest tests/
+```
+
+The demo draws `(2000, 200)` samples from a 5-d latent with `λ_i = i^(-1.5)`,
+re-fits PCA on the result, and prints prescribed vs. recovered eigenvalues —
+they agree to within sampling error, confirming the inverse construction is
+statistically consistent with what a forward PCA would have produced.
+
+---
+
+## File layout
+
+```
+inverse_pca/
+  __init__.py        # public exports
+  generator.py       # InversePCAGenerator + make_synthetic_dataset
+examples/
+  demo.py            # spectrum-recovery sanity check
+tests/
+  test_generator.py  # round-trip, covariance, validation, custom hooks
+```
