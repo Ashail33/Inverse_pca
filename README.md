@@ -291,6 +291,64 @@ statistically consistent with what a forward PCA would have produced.
 
 ---
 
+## Worked examples with figures
+
+All five plots below are produced by
+
+```bash
+PYTHONPATH=. python examples/plot_examples.py
+```
+
+which writes them to `examples/figures/`.
+
+### Example 1 — Re-fit PCA recovers the prescribed spectrum
+
+`d=200`, `k=10`, `n=4 000`, `λ_i = i^(-1.5)`, `σ=0.05`. Empirical eigenvalues
+of `Cov(X)` track the prescribed `λ_i` for the first ten components, then
+collapse to the `σ²` noise floor — the population covariance
+`V diag(λ) V.T + σ² I` is recovered up to sampling noise.
+
+![Spectrum recovery](examples/figures/01_spectrum_recovery.png)
+
+### Example 2 — Built-in spectrum profiles
+
+The shape of `λ_i` controls how concentrated the signal is in the leading
+components. Power (low α) gives slow polynomial decay, exponential gives
+a knee, linear is gentle, uniform is isotropic — pick whichever matches the
+benchmark you want.
+
+![Spectrum profiles](examples/figures/02_spectrum_profiles.png)
+
+### Example 3 — Latent distribution changes the *shape*, not the covariance
+
+All four panels use an isotropic spectrum (`λ = [1, 1]`), so each cloud has
+the same covariance. The Gaussian latent gives round contours, the uniform
+latent gives a sharp-edged square (rotated by the random `V`), Laplace is
+peaked with longer tails, Student-t (`df=5`) is heavy-tailed.
+
+![Latent distributions](examples/figures/03_latent_distributions.png)
+
+### Example 4 — Cluster structure in the latent space survives
+
+A three-cluster Gaussian-mixture latent (`k=4`) is pushed through to
+`d=50` and corrupted with `σ=0.1` noise. Re-fitting PCA on the high-dim
+sample and projecting onto its top two components recovers the original
+cluster geometry up to a rotation/reflection of the latent axes — exactly
+what you'd want when generating synthetic classification benchmarks.
+
+![Clustered latent](examples/figures/04_clustered_latent.png)
+
+### Example 5 — Sweeping the noise level
+
+Same five-spike spectrum `λ = [4, 2, 1, 0.5, 0.25]`, varying `σ`. The signal
+eigenvalues stay in place; the trailing `d − k` axes collect a flat bulk
+near `σ²`. With `σ = 0` the bulk is at machine precision (numerical zero),
+giving the clean rank-`k` plateau on the blue line.
+
+![Noise floor sweep](examples/figures/05_noise_floor.png)
+
+---
+
 ## File layout
 
 ```
@@ -298,7 +356,9 @@ inverse_pca/
   __init__.py        # public exports
   generator.py       # InversePCAGenerator + make_synthetic_dataset
 examples/
-  demo.py            # spectrum-recovery sanity check
+  demo.py            # spectrum-recovery sanity check (text output)
+  plot_examples.py   # generates the figures shown above
+  figures/           # PNGs produced by plot_examples.py
 tests/
   test_generator.py  # round-trip, covariance, validation, custom hooks
 ```
